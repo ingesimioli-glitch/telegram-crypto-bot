@@ -31,7 +31,7 @@ SOLANA_REGEX = re.compile(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b')
 ENS_REGEX = re.compile(r'\b(?:[a-zA-Z0-9-]+\.)+eth\b')
 SNS_REGEX = re.compile(r'\b(?:[a-zA-Z0-9-_]+\.)+sol\b')
 
-# RPC Configurations with working public fallbacks
+# RPC Configurations for Native Balances
 RPC_CONFIG = {
     "EVM": {
         "Ethereum (ETH)": {"url": os.getenv("ETH_RPC_URL", "https://ethereum-rpc.publicnode.com"), "token": "ETH"},
@@ -43,6 +43,15 @@ RPC_CONFIG = {
     "Solana": {
         "Solana (SOL)": {"url": os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"), "token": "SOL"}
     }
+}
+
+# Blockscout endpoints for fetching ERC-20 tokens
+BLOCKSCOUT_CONFIG = {
+    "Ethereum": "https://eth.blockscout.com",
+    "Arbitrum": "https://arbitrum.blockscout.com",
+    "Optimism": "https://optimism.blockscout.com",
+    "Polygon": "https://polygon.blockscout.com",
+    "BSC": "https://blockscout.com/bsc/mainnet",
 }
 
 # Price Caching
@@ -192,6 +201,41 @@ async def fetch_solana_balance(client: httpx.AsyncClient, rpc_url: str, address:
         logging.warning(f"Error fetching Solana balance for {address}: {e}")
         return {"chain": "Solana (SOL)", "error": str(e), "token": "SOL", "success": False}
 
+async def fetch_blockscout_tokens(client: httpx.AsyncClient, chain_name: str, base_url: str, address: str) -> list:
+    """Fetch all ERC-20 token balances for a wallet address from Blockscout API."""
+    url = f"{base_url}/api/v2/addresses/{address}/token-balances"
+    try:
+        response = await client.get(url, timeout=8.0)
+        if response.status_code == 200:
+            data = response.json()
+            tokens = []
+            for item in data:
+                token_info = item.get("token")
+                if not token_info or token_info.get("type") != "ERC-20":
+                    continue
+                value = item.get("value")
+                if not value or value == "0":
+                    continue
+                
+                decimals = int(token_info.get("decimals") or "18")
+                balance = float(value) / 10**decimals
+                price = float(token_info.get("exchange_rate") or 0.0)
+                usd_value = balance * price
+                
+                # Filter out dust (< $0.50)
+                if usd_value > 0.50:
+                    tokens.append({
+                        "name": token_info.get("name", "Unknown"),
+                        "symbol": token_info.get("symbol", "UNKNOWN"),
+                        "balance": balance,
+                        "usd_value": usd_value,
+                        "chain": chain_name
+                    })
+            return tokens
+    except Exception as e:
+        logging.warning(f"Error fetching blockscout tokens on {chain_name}: {e}")
+    return []
+
 async def check_balances(address: str, is_evm: bool):
     """Check balances for an address concurrently using HTTPX AsyncClient."""
     async with httpx.AsyncClient() as client:
@@ -221,11 +265,12 @@ def format_balance(val: float) -> str:
 async def send_welcome(message: types.Message):
     """Welcome and Help command handler."""
     welcome_text = (
-        "👋 <b>Привет! Я бот для проверки баланса криптокошельков и доменных имен.</b>\n\n"
+        "👋 <b>Привет! Я бот для проверки баланса криптокошельков, токенов и доменных имен.</b>\n\n"
         "Добавьте меня в чат, и я буду автоматически отслеживать сообщения "
         "с адресами кошельков (EVM / Solana) или доменными именами (<b>.eth / .sol</b>).\n\n"
         "⭐ <b>Мои функции:</b>\n"
-        "• Проверяет балансы во всех популярных сетях.\n"
+        "• Проверяет балансы нативных монет во всех популярных сетях.\n"
+        "• 🪙 <b>Сканирует все ERC-20 токены</b> в сетях EVM и суммирует их стоимость.\n"
         "• Рассчитывает общую стоимость кошелька в USD по текущему курсу.\n"
         "• 📌 <b>Если баланс Solana кошелька > $11</b>, бот пришлет ссылку на <b>Solscan</b> и закрепит сообщение в чате.\n"
         "• 📌 <b>Если баланс EVM кошелька > $100</b>, бот пришлет ссылку на <b>Etherscan</b> и закрепит сообщение в чате.\n\n"
@@ -238,7 +283,7 @@ async def send_welcome(message: types.Message):
 
 @dp.message(F.text | F.caption)
 async def handle_address_detection(message: types.Message):
-    """Detect, resolve domains, process wallet balances, calculate USD values, and pin high-value balances."""
+    """Detect, resolve domains, process wallet balances, calculate USD values, fetch ERC-20 tokens, and pin high-value balances."""
     # Don't process messages from other bots
     if message.from_user and message.from_user.is_bot:
         return
@@ -311,11 +356,23 @@ async def handle_address_detection(message: types.Message):
         
     # Process detected EVM addresses
     for addr in evm_to_check:
-        balances = await check_balances(addr, is_evm=True)
-        lines = []
+        # Fetch native balances and token balances concurrently
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            native_task = check_balances(addr, is_evm=True)
+            
+            token_tasks = [
+                fetch_blockscout_tokens(client, chain, base_url, addr)
+                for chain, base_url in BLOCKSCOUT_CONFIG.items()
+            ]
+            
+            # Execute all checks in parallel
+            native_balances, *tokens_results = await asyncio.gather(native_task, *token_tasks)
+            
+        # 1. Format Native Balances
+        native_lines = []
         total_usd = 0.0
         
-        for res in balances:
+        for res in native_balances:
             if res["success"]:
                 val = res["balance"]
                 val_str = format_balance(val)
@@ -325,21 +382,50 @@ async def handle_address_detection(message: types.Message):
                 total_usd += usd_value
                 
                 usd_str = f" (~${usd_value:,.2f})" if usd_value > 0.01 else ""
-                lines.append(f"• <b>{res['chain']}</b>: <code>{val_str} {token}</code>{usd_str}")
+                native_lines.append(f"• <b>{res['chain']}</b>: <code>{val_str} {token}</code>{usd_str}")
             else:
-                lines.append(f"• <b>{res['chain']}</b>: <i>Ошибка RPC</i>")
+                native_lines.append(f"• <b>{res['chain']}</b>: <i>Ошибка RPC</i>")
                 
-        balance_summary = "\n".join(lines)
+        # 2. Format ERC-20 Token Balances
+        all_tokens = []
+        for list_of_tokens in tokens_results:
+            all_tokens.extend(list_of_tokens)
+            
+        # Sum up ERC-20 values
+        for t in all_tokens:
+            total_usd += t["usd_value"]
+            
+        # Sort tokens by value descending
+        all_tokens = sorted(all_tokens, key=lambda x: x["usd_value"], reverse=True)
+        
+        token_lines = []
+        for t in all_tokens[:8]:  # Show top 8 tokens
+            val_str = format_balance(t["balance"])
+            token_lines.append(f"• <b>{t['symbol']}</b> ({t['chain']}): <code>{val_str} {t['symbol']}</code> (~${t['usd_value']:,.2f})")
+            
+        if len(all_tokens) > 8:
+            token_lines.append(f"<i>...и еще {len(all_tokens) - 8} токенов на общую сумму ${sum(t['usd_value'] for t in all_tokens[8:]):,.2f} USD</i>")
+            
+        balance_summary = "\n".join(native_lines)
+        token_summary = "\n".join(token_lines)
+        
         title = address_display_names.get(addr, addr)
         
         # Build reply text
         reply_text = (
             f"🔍 <b>EVM Wallet Summary</b>\n"
             f"{title}\n\n"
-            f"💰 <b>Балансы:</b>\n"
+            f"💰 <b>Нативные балансы:</b>\n"
             f"{balance_summary}\n\n"
-            f"💵 <b>Общая стоимость:</b> <b>${total_usd:,.2f} USD</b>"
         )
+        
+        if token_lines:
+            reply_text += (
+                f"🪙 <b>Токены (Топ-8 по ценности):</b>\n"
+                f"{token_summary}\n\n"
+            )
+            
+        reply_text += f"💵 <b>Общая стоимость:</b> <b>${total_usd:,.2f} USD</b>"
         
         # Add Etherscan link if balance > $100
         should_pin = total_usd > 100.0
