@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+import html
 import httpx
 import base58
 from dotenv import load_dotenv
@@ -263,146 +264,159 @@ def format_balance(val: float) -> str:
 
 async def process_custom_address_check(address: str, chat_id: int):
     """Fetch balances and tokens for a specific address, format report, send it to a chat, and optionally pin it."""
-    # Classify address type
-    is_evm = EVM_REGEX.match(address) is not None
-    is_sol = is_valid_solana(address)
-    
-    # Resolve domains if needed
-    if not is_evm and not is_sol:
-        if address.endswith(".eth"):
+    try:
+        # Classify address type
+        is_evm = EVM_REGEX.match(address) is not None
+        is_sol = is_valid_solana(address)
+        
+        # Resolve domains if needed
+        if not is_evm and not is_sol:
+            if address.endswith(".eth"):
+                async with httpx.AsyncClient(follow_redirects=True) as client:
+                    resolved = await resolve_ens(client, address)
+                    if resolved:
+                        address = resolved
+                        is_evm = True
+            elif address.endswith(".sol"):
+                async with httpx.AsyncClient(follow_redirects=True) as client:
+                    resolved = await resolve_sns(client, address)
+                    if resolved:
+                        address = resolved
+                        is_sol = True
+                        
+        if not is_evm and not is_sol:
+            logging.warning(f"Custom check failed: invalid address format for '{address}'")
+            return
+            
+        prices = await get_token_prices()
+        
+        if is_evm:
+            # Check EVM balances
             async with httpx.AsyncClient(follow_redirects=True) as client:
-                resolved = await resolve_ens(client, address)
-                if resolved:
-                    address = resolved
-                    is_evm = True
-        elif address.endswith(".sol"):
-            async with httpx.AsyncClient(follow_redirects=True) as client:
-                resolved = await resolve_sns(client, address)
-                if resolved:
-                    address = resolved
-                    is_sol = True
+                native_task = check_balances(address, is_evm=True)
+                token_tasks = [
+                    fetch_blockscout_tokens(client, chain, base_url, address)
+                    for chain, base_url in BLOCKSCOUT_CONFIG.items()
+                ]
+                native_balances, *tokens_results = await asyncio.gather(native_task, *token_tasks)
+                
+            native_lines = []
+            total_usd = 0.0
+            
+            for res in native_balances:
+                if res["success"]:
+                    val = res["balance"]
+                    val_str = format_balance(val)
+                    token = res["token"]
+                    price = prices.get(token, 0.0)
+                    usd_value = val * price
+                    total_usd += usd_value
                     
-    if not is_evm and not is_sol:
-        logging.warning(f"Custom check failed: invalid address format for '{address}'")
-        return
-        
-    prices = await get_token_prices()
-    
-    if is_evm:
-        # Check EVM balances
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            native_task = check_balances(address, is_evm=True)
-            token_tasks = [
-                fetch_blockscout_tokens(client, chain, base_url, address)
-                for chain, base_url in BLOCKSCOUT_CONFIG.items()
-            ]
-            native_balances, *tokens_results = await asyncio.gather(native_task, *token_tasks)
-            
-        native_lines = []
-        total_usd = 0.0
-        
-        for res in native_balances:
-            if res["success"]:
-                val = res["balance"]
-                val_str = format_balance(val)
-                token = res["token"]
-                price = prices.get(token, 0.0)
-                usd_value = val * price
-                total_usd += usd_value
+                    usd_str = f" (~${usd_value:,.2f})" if usd_value > 0.01 else ""
+                    native_lines.append(f"• <b>{html.escape(res['chain'])}</b>: <code>{val_str} {html.escape(token)}</code>{usd_str}")
+                else:
+                    native_lines.append(f"• <b>{html.escape(res['chain'])}</b>: <i>Ошибка RPC</i>")
+                    
+            all_tokens = []
+            for list_of_tokens in tokens_results:
+                all_tokens.extend(list_of_tokens)
                 
-                usd_str = f" (~${usd_value:,.2f})" if usd_value > 0.01 else ""
-                native_lines.append(f"• <b>{res['chain']}</b>: <code>{val_str} {token}</code>{usd_str}")
-            else:
-                native_lines.append(f"• <b>{res['chain']}</b>: <i>Ошибка RPC</i>")
+            for t in all_tokens:
+                total_usd += t["usd_value"]
                 
-        all_tokens = []
-        for list_of_tokens in tokens_results:
-            all_tokens.extend(list_of_tokens)
+            all_tokens = sorted(all_tokens, key=lambda x: x["usd_value"], reverse=True)
+            token_lines = []
+            for t in all_tokens[:8]:
+                val_str = format_balance(t["balance"])
+                token_lines.append(f"• <b>{html.escape(t['symbol'])}</b> ({html.escape(t['chain'])}): <code>{val_str} {html.escape(t['symbol'])}</code> (~${t['usd_value']:,.2f})")
+                
+            if len(all_tokens) > 8:
+                token_lines.append(f"<i>...и еще {len(all_tokens) - 8} токенов на общую сумму ${sum(t['usd_value'] for t in all_tokens[8:]):,.2f} USD</i>")
+                
+            balance_summary = "\n".join(native_lines)
+            token_summary = "\n".join(token_lines)
             
-        for t in all_tokens:
-            total_usd += t["usd_value"]
-            
-        all_tokens = sorted(all_tokens, key=lambda x: x["usd_value"], reverse=True)
-        token_lines = []
-        for t in all_tokens[:8]:
-            val_str = format_balance(t["balance"])
-            token_lines.append(f"• <b>{t['symbol']}</b> ({t['chain']}): <code>{val_str} {t['symbol']}</code> (~${t['usd_value']:,.2f})")
-            
-        if len(all_tokens) > 8:
-            token_lines.append(f"<i>...и еще {len(all_tokens) - 8} токенов на общую сумму ${sum(t['usd_value'] for t in all_tokens[8:]):,.2f} USD</i>")
-            
-        balance_summary = "\n".join(native_lines)
-        token_summary = "\n".join(token_lines)
-        
-        reply_text = (
-            f"🔍 <b>EVM Wallet Summary</b>\n"
-            f"Адрес: <code>{address}</code>\n\n"
-            f"💰 <b>Нативные балансы:</b>\n"
-            f"{balance_summary}\n\n"
-        )
-        if token_lines:
-            reply_text += (
-                f"🪙 <b>Токены (Топ-8 по ценности):</b>\n"
-                f"{token_summary}\n\n"
+            reply_text = (
+                f"🔍 <b>EVM Wallet Summary</b>\n"
+                f"Адрес: <code>{html.escape(address)}</code>\n\n"
+                f"💰 <b>Нативные балансы:</b>\n"
+                f"{balance_summary}\n\n"
             )
-        reply_text += f"💵 <b>Общая стоимость:</b> <b>${total_usd:,.2f} USD</b>"
-        
-        should_pin = total_usd > 100.0
-        if should_pin:
-            reply_text += f"\n\n🔗 <a href=\"https://etherscan.io/address/{address}\">Смотреть на Etherscan</a>"
+            if token_lines:
+                reply_text += (
+                    f"🪙 <b>Токены (Топ-8 по ценности):</b>\n"
+                    f"{token_summary}\n\n"
+                )
+            reply_text += f"💵 <b>Общая стоимость:</b> <b>${total_usd:,.2f} USD</b>"
             
-        try:
-            sent_message = await bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            should_pin = total_usd > 100.0
             if should_pin:
+                reply_text += f"\n\n🔗 <a href=\"https://etherscan.io/address/{address}\">Смотреть на Etherscan</a>"
+                
+            try:
+                sent_message = await bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                if should_pin:
+                    try:
+                        await sent_message.pin()
+                    except Exception as pin_err:
+                        logging.warning(f"Could not pin custom EVM message: {pin_err}")
+            except Exception as e:
+                logging.error(f"Failed to send custom EVM message to {chat_id} with HTML: {e}")
                 try:
-                    await sent_message.pin()
-                except Exception as pin_err:
-                    logging.warning(f"Could not pin custom EVM message: {pin_err}")
-        except Exception as e:
-            logging.error(f"Failed to send custom EVM message to {chat_id}: {e}")
-            
-    elif is_sol:
-        # Check Solana balances
-        balances = await check_balances(address, is_evm=False)
-        lines = []
-        total_usd = 0.0
-        
-        for res in balances:
-            if res["success"]:
-                val = res["balance"]
-                val_str = format_balance(val)
-                token = res["token"]
-                price = prices.get(token, 0.0)
-                usd_value = val * price
-                total_usd += usd_value
+                    plain_text = re.sub(r'<[^>]+>', '', reply_text)
+                    await bot.send_message(chat_id=chat_id, text=plain_text)
+                except Exception as fallback_err:
+                    logging.error(f"Failed to send fallback custom EVM message to {chat_id}: {fallback_err}")
                 
-                usd_str = f" (~${usd_value:,.2f})" if usd_value > 0.01 else ""
-                lines.append(f"• <b>{res['chain']}</b>: <code>{val_str} {token}</code>{usd_str}")
-            else:
-                lines.append(f"• <b>{res['chain']}</b>: <i>Ошибка RPC</i>")
-                
-        balance_summary = "\n".join(lines)
-        reply_text = (
-            f"🔍 <b>Solana Wallet Summary</b>\n"
-            f"Адрес: <code>{address}</code>\n\n"
-            f"💰 <b>Баланс:</b>\n"
-            f"{balance_summary}\n\n"
-            f"💵 <b>Общая стоимость:</b> <b>${total_usd:,.2f} USD</b>"
-        )
-        
-        should_pin = total_usd > 11.0
-        if should_pin:
-            reply_text += f"\n\n🔗 <a href=\"https://solscan.io/account/{address}\">Смотреть на Solscan</a>"
+        elif is_sol:
+            # Check Solana balances
+            balances = await check_balances(address, is_evm=False)
+            lines = []
+            total_usd = 0.0
+            for res in balances:
+                if res["success"]:
+                    val = res["balance"]
+                    val_str = format_balance(val)
+                    token = res["token"]
+                    price = prices.get(token, 0.0)
+                    usd_value = val * price
+                    total_usd += usd_value
+                    
+                    usd_str = f" (~${usd_value:,.2f})" if usd_value > 0.01 else ""
+                    lines.append(f"• <b>{html.escape(res['chain'])}</b>: <code>{val_str} {html.escape(token)}</code>{usd_str}")
+                else:
+                    lines.append(f"• <b>{html.escape(res['chain'])}</b>: <i>Ошибка RPC</i>")
+                    
+            balance_summary = "\n".join(lines)
+            reply_text = (
+                f"🔍 <b>Solana Wallet Summary</b>\n"
+                f"Адрес: <code>{html.escape(address)}</code>\n\n"
+                f"💰 <b>Баланс:</b>\n"
+                f"{balance_summary}\n\n"
+                f"💵 <b>Общая стоимость:</b> <b>${total_usd:,.2f} USD</b>"
+            )
             
-        try:
-            sent_message = await bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            should_pin = total_usd > 11.0
             if should_pin:
+                reply_text += f"\n\n🔗 <a href=\"https://solscan.io/account/{address}\">Смотреть на Solscan</a>"
+                
+            try:
+                sent_message = await bot.send_message(chat_id=chat_id, text=reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                if should_pin:
+                    try:
+                        await sent_message.pin()
+                    except Exception as pin_err:
+                        logging.warning(f"Could not pin custom Solana message: {pin_err}")
+            except Exception as e:
+                logging.error(f"Failed to send custom Solana message to {chat_id} with HTML: {e}")
                 try:
-                    await sent_message.pin()
-                except Exception as pin_err:
-                    logging.warning(f"Could not pin custom Solana message: {pin_err}")
-        except Exception as e:
-            logging.error(f"Failed to send custom Solana message to {chat_id}: {e}")
+                    plain_text = re.sub(r'<[^>]+>', '', reply_text)
+                    await bot.send_message(chat_id=chat_id, text=plain_text)
+                except Exception as fallback_err:
+                    logging.error(f"Failed to send fallback custom Solana message to {chat_id}: {fallback_err}")
+    except Exception as e:
+        import traceback
+        logging.error(f"Error in process_custom_address_check: {e}\n{traceback.format_exc()}")
 
 async def handle_custom_api_check(request: web.Request) -> web.Response:
     """HTTP endpoint to manually trigger a wallet check from external services."""
@@ -457,206 +471,220 @@ async def send_welcome(message: types.Message):
 @dp.message(F.text | F.caption)
 async def handle_address_detection(message: types.Message):
     """Detect, resolve domains, process wallet balances, calculate USD values, fetch ERC-20 tokens, and pin high-value balances."""
-    text = message.text or message.caption
-    if not text:
-        return
+    try:
+        text = message.text or message.caption
+        if not text:
+            return
+            
+        # Extract addresses and domains
+        evm_addrs, sol_addrs, ens_domains, sns_domains = extract_addresses_and_domains(text)
         
-    # Extract addresses and domains
-    evm_addrs, sol_addrs, ens_domains, sns_domains = extract_addresses_and_domains(text)
-    
-    if not evm_addrs and not sol_addrs and not ens_domains and not sns_domains:
-        return
+        if not evm_addrs and not sol_addrs and not ens_domains and not sns_domains:
+            return
+            
+        # Trigger typing state to show the bot is working
+        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
         
-    # Trigger typing state to show the bot is working
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    
-    # Fetch price ticker
-    prices = await get_token_prices()
-    
-    resolved_evm = {}  # domain -> resolved address
-    resolved_sol = {}  # domain -> resolved address
-    
-    # Resolve domains concurrently
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        # Resolve ENS
-        if ens_domains:
-            ens_tasks = {domain: resolve_ens(client, domain) for domain in ens_domains}
-            ens_results = await asyncio.gather(*ens_tasks.values())
-            for domain, addr in zip(ens_tasks.keys(), ens_results):
-                if addr:
-                    resolved_evm[domain] = addr
-                    
-        # Resolve SNS
-        if sns_domains:
-            sns_tasks = {domain: resolve_sns(client, domain) for domain in sns_domains}
-            sns_results = await asyncio.gather(*sns_tasks.values())
-            for domain, addr in zip(sns_tasks.keys(), sns_results):
-                if addr:
-                    resolved_sol[domain] = addr
-                    
-    # Map addresses to display titles (e.g. "vitalik.eth (0xd8dA6...)")
-    address_display_names = {}
-    
-    # Merge EVM addresses
-    evm_to_check = list(evm_addrs)
-    for domain, addr in resolved_evm.items():
-        address_display_names[addr] = f"🔮 <b>{domain}</b>\n(<code>{addr}</code>)"
-        if addr not in evm_to_check:
-            evm_to_check.append(addr)
-            
-    for addr in evm_addrs:
-        if addr not in address_display_names:
-            address_display_names[addr] = f"Адрес: <code>{addr}</code>"
-            
-    # Merge Solana addresses
-    sol_to_check = list(sol_addrs)
-    for domain, addr in resolved_sol.items():
-        address_display_names[addr] = f"🔮 <b>{domain}</b>\n(<code>{addr}</code>)"
-        if addr not in sol_to_check:
-            sol_to_check.append(addr)
-            
-    for addr in sol_addrs:
-        if addr not in address_display_names:
-            address_display_names[addr] = f"Адрес: <code>{addr}</code>"
-            
-    # If no valid addresses to check, exit
-    if not evm_to_check and not sol_to_check:
-        return
+        # Fetch price ticker
+        prices = await get_token_prices()
         
-    # Process detected EVM addresses
-    for addr in evm_to_check:
-        # Fetch native balances and token balances concurrently
+        resolved_evm = {}  # domain -> resolved address
+        resolved_sol = {}  # domain -> resolved address
+        
+        # Resolve domains concurrently
         async with httpx.AsyncClient(follow_redirects=True) as client:
-            native_task = check_balances(addr, is_evm=True)
-            
-            token_tasks = [
-                fetch_blockscout_tokens(client, chain, base_url, addr)
-                for chain, base_url in BLOCKSCOUT_CONFIG.items()
-            ]
-            
-            # Execute all checks in parallel
-            native_balances, *tokens_results = await asyncio.gather(native_task, *token_tasks)
-            
-        # 1. Format Native Balances
-        native_lines = []
-        total_usd = 0.0
+            # Resolve ENS
+            if ens_domains:
+                ens_tasks = {domain: resolve_ens(client, domain) for domain in ens_domains}
+                ens_results = await asyncio.gather(*ens_tasks.values())
+                for domain, addr in zip(ens_tasks.keys(), ens_results):
+                    if addr:
+                        resolved_evm[domain] = addr
+                        
+            # Resolve SNS
+            if sns_domains:
+                sns_tasks = {domain: resolve_sns(client, domain) for domain in sns_domains}
+                sns_results = await asyncio.gather(*sns_tasks.values())
+                for domain, addr in zip(sns_tasks.keys(), sns_results):
+                    if addr:
+                        resolved_sol[domain] = addr
+                        
+        # Map addresses to display titles (e.g. "vitalik.eth (0xd8dA6...)")
+        address_display_names = {}
         
-        for res in native_balances:
-            if res["success"]:
-                val = res["balance"]
-                val_str = format_balance(val)
-                token = res["token"]
-                price = prices.get(token, 0.0)
-                usd_value = val * price
-                total_usd += usd_value
+        # Merge EVM addresses
+        evm_to_check = list(evm_addrs)
+        for domain, addr in resolved_evm.items():
+            address_display_names[addr] = f"🔮 <b>{html.escape(domain)}</b>\n(<code>{html.escape(addr)}</code>)"
+            if addr not in evm_to_check:
+                evm_to_check.append(addr)
                 
-                usd_str = f" (~${usd_value:,.2f})" if usd_value > 0.01 else ""
-                native_lines.append(f"• <b>{res['chain']}</b>: <code>{val_str} {token}</code>{usd_str}")
-            else:
-                native_lines.append(f"• <b>{res['chain']}</b>: <i>Ошибка RPC</i>")
+        for addr in evm_addrs:
+            if addr not in address_display_names:
+                address_display_names[addr] = f"Адрес: <code>{html.escape(addr)}</code>"
                 
-        # 2. Format ERC-20 Token Balances
-        all_tokens = []
-        for list_of_tokens in tokens_results:
-            all_tokens.extend(list_of_tokens)
+        # Merge Solana addresses
+        sol_to_check = list(sol_addrs)
+        for domain, addr in resolved_sol.items():
+            address_display_names[addr] = f"🔮 <b>{html.escape(domain)}</b>\n(<code>{html.escape(addr)}</code>)"
+            if addr not in sol_to_check:
+                sol_to_check.append(addr)
+                
+        for addr in sol_addrs:
+            if addr not in address_display_names:
+                address_display_names[addr] = f"Адрес: <code>{html.escape(addr)}</code>"
+                
+        # If no valid addresses to check, exit
+        if not evm_to_check and not sol_to_check:
+            return
             
-        # Sum up ERC-20 values
-        for t in all_tokens:
-            total_usd += t["usd_value"]
+        # Process detected EVM addresses
+        for addr in evm_to_check:
+            # Fetch native balances and token balances concurrently
+            async with httpx.AsyncClient(follow_redirects=True) as client:
+                native_task = check_balances(addr, is_evm=True)
+                
+                token_tasks = [
+                    fetch_blockscout_tokens(client, chain, base_url, addr)
+                    for chain, base_url in BLOCKSCOUT_CONFIG.items()
+                ]
+                
+                # Execute all checks in parallel
+                native_balances, *tokens_results = await asyncio.gather(native_task, *token_tasks)
+                
+            # 1. Format Native Balances
+            native_lines = []
+            total_usd = 0.0
             
-        # Sort tokens by value descending
-        all_tokens = sorted(all_tokens, key=lambda x: x["usd_value"], reverse=True)
-        
-        token_lines = []
-        for t in all_tokens[:8]:  # Show top 8 tokens
-            val_str = format_balance(t["balance"])
-            token_lines.append(f"• <b>{t['symbol']}</b> ({t['chain']}): <code>{val_str} {t['symbol']}</code> (~${t['usd_value']:,.2f})")
+            for res in native_balances:
+                if res["success"]:
+                    val = res["balance"]
+                    val_str = format_balance(val)
+                    token = res["token"]
+                    price = prices.get(token, 0.0)
+                    usd_value = val * price
+                    total_usd += usd_value
+                    
+                    usd_str = f" (~${usd_value:,.2f})" if usd_value > 0.01 else ""
+                    native_lines.append(f"• <b>{html.escape(res['chain'])}</b>: <code>{val_str} {html.escape(token)}</code>{usd_str}")
+                else:
+                    native_lines.append(f"• <b>{html.escape(res['chain'])}</b>: <i>Ошибка RPC</i>")
+                    
+            # 2. Format ERC-20 Token Balances
+            all_tokens = []
+            for list_of_tokens in tokens_results:
+                all_tokens.extend(list_of_tokens)
+                
+            # Sum up ERC-20 values
+            for t in all_tokens:
+                total_usd += t["usd_value"]
+                
+            # Sort tokens by value descending
+            all_tokens = sorted(all_tokens, key=lambda x: x["usd_value"], reverse=True)
             
-        if len(all_tokens) > 8:
-            token_lines.append(f"<i>...и еще {len(all_tokens) - 8} токенов на общую сумму ${sum(t['usd_value'] for t in all_tokens[8:]):,.2f} USD</i>")
+            token_lines = []
+            for t in all_tokens[:8]:  # Show top 8 tokens
+                val_str = format_balance(t["balance"])
+                token_lines.append(f"• <b>{html.escape(t['symbol'])}</b> ({html.escape(t['chain'])}): <code>{val_str} {html.escape(t['symbol'])}</code> (~${t['usd_value']:,.2f})")
+                
+            if len(all_tokens) > 8:
+                token_lines.append(f"<i>...и еще {len(all_tokens) - 8} токенов на общую сумму ${sum(t['usd_value'] for t in all_tokens[8:]):,.2f} USD</i>")
+                
+            balance_summary = "\n".join(native_lines)
+            token_summary = "\n".join(token_lines)
             
-        balance_summary = "\n".join(native_lines)
-        token_summary = "\n".join(token_lines)
-        
-        title = address_display_names.get(addr, addr)
-        
-        # Build reply text
-        reply_text = (
-            f"🔍 <b>EVM Wallet Summary</b>\n"
-            f"{title}\n\n"
-            f"💰 <b>Нативные балансы:</b>\n"
-            f"{balance_summary}\n\n"
-        )
-        
-        if token_lines:
-            reply_text += (
-                f"🪙 <b>Токены (Топ-8 по ценности):</b>\n"
-                f"{token_summary}\n\n"
+            title = address_display_names.get(addr, addr)
+            
+            # Build reply text
+            reply_text = (
+                f"🔍 <b>EVM Wallet Summary</b>\n"
+                f"{title}\n\n"
+                f"💰 <b>Нативные балансы:</b>\n"
+                f"{balance_summary}\n\n"
             )
             
-        reply_text += f"💵 <b>Общая стоимость:</b> <b>${total_usd:,.2f} USD</b>"
-        
-        # Add Etherscan link if balance > $100
-        should_pin = total_usd > 100.0
-        if should_pin:
-            reply_text += f"\n\n🔗 <a href=\"https://etherscan.io/address/{addr}\">Смотреть на Etherscan</a>"
-            
-        try:
-            reply_message = await message.reply(reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            if should_pin:
-                try:
-                    await reply_message.pin()
-                except Exception as pin_err:
-                    logging.warning(f"Could not pin EVM message: {pin_err}")
-        except Exception as e:
-            logging.error(f"Failed to send EVM reply for {addr}: {e}")
-        
-    # Process detected Solana addresses
-    for addr in sol_to_check:
-        balances = await check_balances(addr, is_evm=False)
-        lines = []
-        total_usd = 0.0
-        
-        for res in balances:
-            if res["success"]:
-                val = res["balance"]
-                val_str = format_balance(val)
-                token = res["token"]
-                price = prices.get(token, 0.0)
-                usd_value = val * price
-                total_usd += usd_value
+            if token_lines:
+                reply_text += (
+                    f"🪙 <b>Токены (Топ-8 по ценности):</b>\n"
+                    f"{token_summary}\n\n"
+                )
                 
-                usd_str = f" (~${usd_value:,.2f})" if usd_value > 0.01 else ""
-                lines.append(f"• <b>{res['chain']}</b>: <code>{val_str} {token}</code>{usd_str}")
-            else:
-                lines.append(f"• <b>{res['chain']}</b>: <i>Ошибка RPC</i>")
-                
-        balance_summary = "\n".join(lines)
-        title = address_display_names.get(addr, addr)
-        
-        # Build reply text
-        reply_text = (
-            f"🔍 <b>Solana Wallet Summary</b>\n"
-            f"{title}\n\n"
-            f"💰 <b>Баланс:</b>\n"
-            f"{balance_summary}\n\n"
-            f"💵 <b>Общая стоимость:</b> <b>${total_usd:,.2f} USD</b>"
-        )
-        
-        # Add Solscan link if balance > $11
-        should_pin = total_usd > 11.0
-        if should_pin:
-            reply_text += f"\n\n🔗 <a href=\"https://solscan.io/account/{addr}\">Смотреть на Solscan</a>"
+            reply_text += f"💵 <b>Общая стоимость:</b> <b>${total_usd:,.2f} USD</b>"
             
-        try:
-            reply_message = await message.reply(reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            # Add Etherscan link if balance > $100
+            should_pin = total_usd > 100.0
             if should_pin:
+                reply_text += f"\n\n🔗 <a href=\"https://etherscan.io/address/{addr}\">Смотреть на Etherscan</a>"
+                
+            try:
+                reply_message = await message.reply(reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                if should_pin:
+                    try:
+                        await reply_message.pin()
+                    except Exception as pin_err:
+                        logging.warning(f"Could not pin EVM message: {pin_err}")
+            except Exception as e:
+                logging.error(f"Failed to send EVM reply for {addr} with HTML: {e}")
                 try:
-                    await reply_message.pin()
-                except Exception as pin_err:
-                    logging.warning(f"Could not pin Solana message: {pin_err}")
-        except Exception as e:
-            logging.error(f"Failed to send Solana reply for {addr}: {e}")
+                    plain_text = re.sub(r'<[^>]+>', '', reply_text)
+                    await message.reply(plain_text)
+                except Exception as fallback_err:
+                    logging.error(f"Failed to send fallback EVM reply for {addr}: {fallback_err}")
+            
+        # Process detected Solana addresses
+        for addr in sol_to_check:
+            balances = await check_balances(addr, is_evm=False)
+            lines = []
+            total_usd = 0.0
+            
+            for res in balances:
+                if res["success"]:
+                    val = res["balance"]
+                    val_str = format_balance(val)
+                    token = res["token"]
+                    price = prices.get(token, 0.0)
+                    usd_value = val * price
+                    total_usd += usd_value
+                    
+                    usd_str = f" (~${usd_value:,.2f})" if usd_value > 0.01 else ""
+                    lines.append(f"• <b>{html.escape(res['chain'])}</b>: <code>{val_str} {html.escape(token)}</code>{usd_str}")
+                else:
+                    lines.append(f"• <b>{html.escape(res['chain'])}</b>: <i>Ошибка RPC</i>")
+                    
+            balance_summary = "\n".join(lines)
+            title = address_display_names.get(addr, addr)
+            
+            # Build reply text
+            reply_text = (
+                f"🔍 <b>Solana Wallet Summary</b>\n"
+                f"{title}\n\n"
+                f"💰 <b>Баланс:</b>\n"
+                f"{balance_summary}\n\n"
+                f"💵 <b>Общая стоимость:</b> <b>${total_usd:,.2f} USD</b>"
+            )
+            
+            # Add Solscan link if balance > $11
+            should_pin = total_usd > 11.0
+            if should_pin:
+                reply_text += f"\n\n🔗 <a href=\"https://solscan.io/account/{addr}\">Смотреть на Solscan</a>"
+                
+            try:
+                reply_message = await message.reply(reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                if should_pin:
+                    try:
+                        await reply_message.pin()
+                    except Exception as pin_err:
+                        logging.warning(f"Could not pin Solana message: {pin_err}")
+            except Exception as e:
+                logging.error(f"Failed to send Solana reply for {addr} with HTML: {e}")
+                try:
+                    plain_text = re.sub(r'<[^>]+>', '', reply_text)
+                    await message.reply(plain_text)
+                except Exception as fallback_err:
+                    logging.error(f"Failed to send fallback Solana reply for {addr}: {fallback_err}")
+    except Exception as e:
+        import traceback
+        logging.error(f"Unhandled error in handle_address_detection: {e}\n{traceback.format_exc()}")
 
 async def on_startup(bot: Bot) -> None:
     """Set webhook when running on Render."""
