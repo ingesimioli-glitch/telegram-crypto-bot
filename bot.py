@@ -624,12 +624,21 @@ async def handle_address_detection(message: types.Message):
                     except Exception as pin_err:
                         logging.warning(f"Could not pin EVM message: {pin_err}")
             except Exception as e:
-                logging.error(f"Failed to send EVM reply for {addr} with HTML: {e}")
+                logging.error(f"Failed to reply EVM message for {addr} with HTML: {e}. Trying direct send...")
                 try:
-                    plain_text = re.sub(r'<[^>]+>', '', reply_text)
-                    await message.reply(plain_text)
-                except Exception as fallback_err:
-                    logging.error(f"Failed to send fallback EVM reply for {addr}: {fallback_err}")
+                    sent_message = await bot.send_message(chat_id=message.chat.id, text=reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                    if should_pin:
+                        try:
+                            await sent_message.pin()
+                        except Exception as pin_err:
+                            logging.warning(f"Could not pin EVM message: {pin_err}")
+                except Exception as send_err:
+                    logging.error(f"Failed to send direct EVM message for {addr} with HTML: {send_err}. Trying plain text fallback...")
+                    try:
+                        plain_text = re.sub(r'<[^>]+>', '', reply_text)
+                        await bot.send_message(chat_id=message.chat.id, text=plain_text)
+                    except Exception as fallback_err:
+                        logging.error(f"Failed to send fallback EVM message for {addr}: {fallback_err}")
             
         # Process detected Solana addresses
         for addr in sol_to_check:
@@ -676,12 +685,21 @@ async def handle_address_detection(message: types.Message):
                     except Exception as pin_err:
                         logging.warning(f"Could not pin Solana message: {pin_err}")
             except Exception as e:
-                logging.error(f"Failed to send Solana reply for {addr} with HTML: {e}")
+                logging.error(f"Failed to reply Solana message for {addr} with HTML: {e}. Trying direct send...")
                 try:
-                    plain_text = re.sub(r'<[^>]+>', '', reply_text)
-                    await message.reply(plain_text)
-                except Exception as fallback_err:
-                    logging.error(f"Failed to send fallback Solana reply for {addr}: {fallback_err}")
+                    sent_message = await bot.send_message(chat_id=message.chat.id, text=reply_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                    if should_pin:
+                        try:
+                            await sent_message.pin()
+                        except Exception as pin_err:
+                            logging.warning(f"Could not pin Solana message: {pin_err}")
+                except Exception as send_err:
+                    logging.error(f"Failed to send direct Solana message for {addr} with HTML: {send_err}. Trying plain text fallback...")
+                    try:
+                        plain_text = re.sub(r'<[^>]+>', '', reply_text)
+                        await bot.send_message(chat_id=message.chat.id, text=plain_text)
+                    except Exception as fallback_err:
+                        logging.error(f"Failed to send fallback Solana message for {addr}: {fallback_err}")
     except Exception as e:
         import traceback
         logging.error(f"Unhandled error in handle_address_detection: {e}\n{traceback.format_exc()}")
@@ -695,6 +713,7 @@ async def on_startup(bot: Bot) -> None:
 async def main_polling():
     """Start bot in polling mode (default local)."""
     logging.info("Starting bot polling...")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 def main():
