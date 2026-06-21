@@ -1,0 +1,21 @@
+services:
+  - type: worker
+    name: telegram-crypto-balance-bot
+    runtime: docker
+    repo: https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME # Update this when deploying
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false # Set this in Render Dashboard for security
+      - key: ETH_RPC_URL
+        value: https://ethereum-rpc.publicnode.com
+      - key: BSC_RPC_URL
+        value: https://bsc-dataseed.binance.org/
+      - key: POLYGON_RPC_URL
+        value: https://polygon-bor-rpc.publicnode.com
+      - key: ARBITRUM_RPC_URL
+        value: https://arb1.arbitrum.io/rpc
+      - key: OPTIMISM_RPC_URL
+        value: https://mainnet.optimism.io
+      - key: SOLANA_RPC_URL
+        value: https://api.mainnet-beta.solana.com
