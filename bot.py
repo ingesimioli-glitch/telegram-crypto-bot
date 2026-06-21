@@ -284,10 +284,6 @@ async def send_welcome(message: types.Message):
 @dp.message(F.text | F.caption)
 async def handle_address_detection(message: types.Message):
     """Detect, resolve domains, process wallet balances, calculate USD values, fetch ERC-20 tokens, and pin high-value balances."""
-    # Don't process messages from other bots
-    if message.from_user and message.from_user.is_bot:
-        return
-        
     text = message.text or message.caption
     if not text:
         return
