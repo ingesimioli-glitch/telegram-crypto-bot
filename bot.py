@@ -61,6 +61,14 @@ PRICE_CACHE = {
     "last_fetched": 0
 }
 
+# Ignored wallets and domains (e.g. Vitalik's address/domain)
+IGNORED_ADDRESSES = {
+    "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+}
+IGNORED_DOMAINS = {
+    "vitalik.eth"
+}
+
 # Initialize bot and dispatcher
 bot = Bot(token=TOKEN) if TOKEN else None
 dp = Dispatcher()
@@ -79,23 +87,24 @@ def extract_addresses_and_domains(text: str):
     evm_candidates = EVM_REGEX.findall(text)
     evm_dict = {}
     for cand in evm_candidates:
-        evm_dict[cand.lower()] = cand
+        if cand.lower() not in IGNORED_ADDRESSES:
+            evm_dict[cand.lower()] = cand
     evm_addresses = list(evm_dict.values())
     
     # Solana Addresses
     sol_candidates = SOLANA_REGEX.findall(text)
     sol_addresses = []
     for cand in sol_candidates:
-        if is_valid_solana(cand) and cand not in sol_addresses:
+        if cand.lower() not in IGNORED_ADDRESSES and is_valid_solana(cand) and cand not in sol_addresses:
             sol_addresses.append(cand)
             
     # ENS Domains
     ens_candidates = ENS_REGEX.findall(text)
-    ens_domains = sorted(list(set([d.lower() for d in ens_candidates])))
+    ens_domains = sorted(list(set([d.lower() for d in ens_candidates if d.lower() not in IGNORED_DOMAINS])))
     
     # SNS Domains
     sns_candidates = SNS_REGEX.findall(text)
-    sns_domains = sorted(list(set([d.lower() for d in sns_candidates])))
+    sns_domains = sorted(list(set([d.lower() for d in sns_candidates if d.lower() not in IGNORED_DOMAINS])))
             
     return evm_addresses, sol_addresses, ens_domains, sns_domains
 
@@ -265,6 +274,12 @@ def format_balance(val: float) -> str:
 async def process_custom_address_check(address: str, chat_id: int):
     """Fetch balances and tokens for a specific address, format report, send it to a chat, and optionally pin it."""
     try:
+        # Check if address/domain is ignored
+        addr_clean = address.strip().lower()
+        if addr_clean in IGNORED_ADDRESSES or addr_clean in IGNORED_DOMAINS:
+            logging.info(f"Ignoring custom check for ignored address/domain: {address}")
+            return
+            
         # Classify address type
         is_evm = EVM_REGEX.match(address) is not None
         is_sol = is_valid_solana(address)
@@ -275,12 +290,18 @@ async def process_custom_address_check(address: str, chat_id: int):
                 async with httpx.AsyncClient(follow_redirects=True) as client:
                     resolved = await resolve_ens(client, address)
                     if resolved:
+                        if resolved.lower() in IGNORED_ADDRESSES:
+                            logging.info(f"Ignoring custom check for resolved ENS address: {resolved}")
+                            return
                         address = resolved
                         is_evm = True
             elif address.endswith(".sol"):
                 async with httpx.AsyncClient(follow_redirects=True) as client:
                     resolved = await resolve_sns(client, address)
                     if resolved:
+                        if resolved.lower() in IGNORED_ADDRESSES:
+                            logging.info(f"Ignoring custom check for resolved SNS address: {resolved}")
+                            return
                         address = resolved
                         is_sol = True
                         
